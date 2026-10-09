@@ -1,0 +1,400 @@
+================================================================================
+1_архитектура.txt — архитектура Java messaging pipeline (домашнее задание)
+Документ для собеседования: зафиксированные решения, компоненты, краевые случаи.
+================================================================================
+
+1. Постановка задачи (из задача.txt)
+--------------------------------------------------------------------------------
+Реализовать небольшое Java-приложение, эмулирующее пайплайн сообщений
+(как из брокера, например TIBCO):
+
+  • Вход: сообщения «приходят» со скоростью t1 (эмуляция: JSON-файлы в папке In/).
+  • Обработка: каждое сообщение обрабатывается со скоростью t2, причём t2 > t1.
+  • Выход: после обработки сообщение «отправляется» снова со скоростью t1
+    (эмуляция: JSON-файлы в папке Out/).
+  • Порядок сообщений на выходе НЕ должен меняться относительно порядка на входе.
+
+Смысл условия t2 > t1: однопоточная обработка не успевает за входом и копит
+бэклог; нужен параллельный worker-пул при сохранении порядка на выходе.
+
+
+2. Зафиксированные решения
+--------------------------------------------------------------------------------
+| Вопрос                         | Решение                                              |
+|--------------------------------|------------------------------------------------------|
+| t1 / t2 по умолчанию           | 100 ms / 300 ms                                      |
+| Конфиг                         | application.properties (ключи — см. §5)              |
+| Формат сообщения               | простой JSON-объект, напр. {"id":1,"text":"..."}     |
+| «Обработка»                    | sleep(t2) + добавить поле processedAt (timestamp)    |
+| Порядок чтения In/             | лексикографически по имени файла (рекоменд. 001.json)|
+| Сборка                         | Maven                                                |
+| Версия Java                    | 17                                                   |
+| Битый / пустой JSON            | skip + лог; seq НЕ назначать                         |
+| Целевое решение                | пул Worker’ов + ReorderBuffer                        |
+| ReorderBuffer (целевое)        | кольцевой буфер (ring buffer), окно = app.reorder.window |
+| Упрощённая альтернатива        | TreeMap/ConcurrentHashMap по seq + nextExpected      |
+| Reader / Writer                | по одному потоку каждый                              |
+| Очередь между Reader и Workers | bounded (backpressure)                               |
+
+
+3. Архитектура пайплайна
+--------------------------------------------------------------------------------
+
+ASCII-схема:
+
+  In/*.json
+      |
+      v
+  +----------------+    sleep(t1)     +------------------+
+  | FileReader     | ---------------> | ProcessingQueue  |
+  | (1 поток)      |   put(Message)   | (bounded)        |
+  | + присвоение   |                  +--------+---------+
+  |   seq          |                           |
+  +----------------+                           | take()
+                                               v
+                                    +----------------------+
+                                    | Workers (N потоков)  |
+                                    | N ≈ ceil(t2/t1)      |
+                                    | sleep(t2)+processedAt|
+                                    +----------+-----------+
+                                               |
+                                               | complete(seq, result)
+                                               | или fail → tombstone
+                                               v
+                                    +----------------------+
+                                    | ReorderBuffer        |
+                                    | (ring buffer)        |
+                                    | слоты по seq%window, |
+                                    | отдаёт по nextExpected|
+                                    +----------+-----------+
+                                               |
+                                               | poll next in-order
+                                               v
+                                    +----------------------+     sleep(t1)
+                                    | FileWriter (1 поток) | ------------> Out/*.json
+                                    +----------------------+
+
+Компоненты:
+
+| Компонент        | Потоки | Роль |
+|------------------|--------|------|
+| FileReader       | 1      | Сканирует In/, фильтрует *.json, сортирует по имени, парсит JSON, назначает seq, кладёт в очередь, sleep(t1) между чтениями. |
+| ProcessingQueue  | —      | Bounded BlockingQueue между Reader и Workers; создаёт backpressure, если workers не успевают. |
+| Workers          | N      | Берут Message из очереди, «обрабатывают» (sleep(t2) + processedAt), передают результат в ReorderBuffer. |
+| ReorderBuffer    | shared | Кольцевой буфер (ring buffer) размера window; Writer забирает только слот nextExpected (DATA → файл, TOMBSTONE → skip). |
+| FileWriter       | 1      | Пишет JSON в Out/ с именем, padded по seq; sleep(t1) между записями. |
+
+
+3.1. ReorderBuffer = кольцевой буфер (ring buffer)
+--------------------------------------------------------------------------------
+Целевая реализация (как на собесе): фиксированный массив слотов длиной window
+(= app.reorder.window).
+
+  slots[window], каждый Slot = EMPTY | DATA | TOMBSTONE
+  • EMPTY     — слот свободен / ещё не заполнен для текущего seq
+  • DATA      — готовый результат обработки (писать в Out/)
+  • TOMBSTONE — seq «закрыт» без полезных данных (skip записи, курсор двигается)
+
+Курсоры:
+  • nextToWrite   — нижняя граница окна записи со стороны Writer (seq, который
+                    Writer сейчас может забрать, если слот не EMPTY).
+  • nextExpected  — то же по смыслу порядка выдачи: Writer ждёт слот с этим seq
+                    (можно считать nextExpected ≡ nextToWrite у Writer’а).
+  • index(seq)    = seq % window
+
+Правила put (worker):
+  • Worker может положить результат только если
+      seq ∈ [nextToWrite, nextToWrite + window).
+  • Иначе ждать (backpressure на workers): окно ещё не сдвинулось,
+    слот для этого seq занят «старым» незабранным сообщением.
+  • При успехе: slots[index(seq)] = DATA (или TOMBSTONE при fail) + payload.
+
+Правила take (Writer):
+  • Смотрит слот slots[nextToWrite % window].
+  • Если EMPTY — ждать (дыра: out-of-order ещё не догнал).
+  • Если DATA — отдать сообщение Writer’у для записи в файл, очистить слот
+    (→ EMPTY), nextToWrite++.
+  • Если TOMBSTONE — файл НЕ писать, слот очистить, nextToWrite++ (skip).
+
+Упрощённая альтернатива (не целевая): TreeMap / ConcurrentHashMap по seq
++ nextExpected. Проще код и отладка, но на собесе зафиксирован ring buffer.
+
+
+4. Сохранение порядка
+--------------------------------------------------------------------------------
+• seq — монотонный счётчик, назначается ТОЛЬКО FileReader’ом после успешного
+  парсинга валидного JSON (битые файлы seq не получают).
+• Один Reader и один Writer исключают гонки на назначении порядка и на записи.
+• Workers работают параллельно → результаты могут завершаться out-of-order.
+• ReorderBuffer (ring): результат кладётся в slots[seq % window]; Writer
+  забирает строго слот nextExpected / nextToWrite. Пока слот EMPTY («дыра»),
+  Writer ждёт; TOMBSTONE пропускает запись, но двигает курсор.
+• Зачем параллель: при t2 > t1 один worker не успевает; N ≈ t2/t1 workers
+  дают суммарную пропускную способность обработки ≈ скорости входа, а reorder
+  восстанавливает порядок на выходе.
+
+
+5. Конфигурация
+--------------------------------------------------------------------------------
+Файл: src/main/resources/application.properties
+
+Ключи (предложение) и defaults:
+
+  app.t1.ms=100
+  app.t2.ms=300
+  app.in.dir=In
+  app.out.dir=Out
+  app.queue.capacity=100
+  app.reorder.window=1000
+  app.workers=0
+      # 0 = вычислить автоматически: N = max(1, ceil(t2/t1))
+      # при t1=100, t2=300 → N = 3
+  app.write.retry.count=3
+  app.write.retry.delay.ms=50
+
+Вычисление N workers:
+  если app.workers > 0 → использовать заданное значение;
+  иначе N = max(1, (int) Math.ceil((double) t2 / t1)).
+
+Валидация при старте — см. §7.1.
+
+
+6. Структура проекта (Maven, Java 17)
+--------------------------------------------------------------------------------
+messaging-pipeline/
+├── pom.xml                          (Java 17, mainClass = ...App)
+├── src/main/java/com/renaissance/pipeline/
+│   ├── App.java                     # main, lifecycle, shutdown hook
+│   ├── config/
+│   │   └── AppConfig.java           # загрузка/валидация properties
+│   ├── model/
+│   │   └── Message.java             # seq, payload (Map/JsonNode), processedAt
+│   ├── reader/
+│   │   └── FileReader.java          # In/, seq, sleep(t1) → queue
+│   ├── worker/
+│   │   └── ProcessingWorker.java    # take → sleep(t2)+processedAt → buffer
+│   ├── buffer/
+│   │   └── ReorderBuffer.java       # ring buffer: slots[window], put/poll by seq % window
+│   ├── writer/
+│   │   └── FileWriter.java          # Out/, padded name, sleep(t1)
+│   └── util/
+│       └── JsonSupport.java         # parse/serialize (простая библиотека или вручную)
+├── src/main/resources/
+│   └── application.properties
+├── In/                              # входные *.json (рядом с запуском / конфиг)
+└── Out/                             # выходные файлы
+
+Зависимости: минимум — Jackson (или Gson) для JSON; JUnit 5 для тестов (см. §9).
+Без Spring: обычный main + ExecutorService.
+Тесты: src/test/java/… + application-test.properties (см. §9.4).
+
+
+7. Поведение при краевых и ошибочных ситуациях
+--------------------------------------------------------------------------------
+
+7.1. Конфигурация
+  • Нет application.properties / файл не найден
+      → стартовать с defaults (t1=100, t2=300, …); WARN в лог.
+  • Значение нечисловое или ≤ 0 для t1, t2, queue.capacity, reorder.window
+      → FAIL start (понятная ошибка, exit ≠ 0). Не молчать.
+  • t2 ≤ t1
+      → WARNING (условие задачи нарушено; бэклог/параллелизм не нужны,
+        но приложение может продолжить работу для демо).
+  • app.workers < 0
+      → FAIL start.
+  • app.workers = 0
+      → авто-расчёт N = max(1, ceil(t2/t1)).
+  • app.workers > 0
+      → использовать как есть (даже если ≠ ceil(t2/t1)); INFO в лог.
+
+7.2. Входная папка In/
+  • Папки In нет
+      → создать пустую ИЛИ FAIL start с сообщением (принято: создать + WARN,
+        либо fail — зафиксировать в коде единообразно; рекомендация: FAIL start,
+        т.к. «нет источника» — явная ошибка окружения).
+  • In пустая
+      → Reader завершает чтение (EOF / end-of-input), пайплайн drain’ит очередь
+        и корректно останавливается; не крутиться бесконечно в пустом каталоге
+        (для homework: one-shot batch по снимку списка файлов при старте
+        или один проход по каталогу).
+  • Файлы не *.json
+      → игнорировать молча (или DEBUG-лог).
+  • Битый JSON / пустой файл / не-объект
+      → SKIP + ERROR/WARN лог с именем файла;
+        seq НЕ назначать, в очередь НЕ класть.
+  • Лексикографическая сортировка имён
+      • Осторожно: 1.json, 10.json, 2.json → порядок 1, 10, 2 (не числовой!).
+      • Рекомендация для демо-данных: zero-padded имена 001.json, 002.json, …
+  • Файл исчез / недоступен во время чтения (удалили после listing)
+      → SKIP + лог; не падать всем приложением; seq не назначать.
+
+7.3. Пайплайн (очередь / workers / reorder)
+  • Worker упал ПОСЛЕ того, как сообщение уже получило seq
+      → в кольцевой слот slots[seq % window] положить TOMBSTONE,
+        чтобы Writer не завис навечно на EMPTY («дыра»): курсор
+        nextToWrite сдвинется без записи файла.
+      → лог ERROR с seq и причиной.
+  • Bounded queue заполнена
+      → Reader блокируется на put (backpressure): не читать быстрее, чем
+        система успевает обрабатывать; это ожидаемое поведение при пиках.
+  • Окно ring buffer (app.reorder.window)
+      → worker put разрешён только при seq ∈ [nextToWrite, nextToWrite+window);
+        иначе блокировка put’а (backpressure на workers). Слот физически один
+        на seq%window — без сдвига Writer’а перезапись невозможна / запрещена.
+      → «дыра» (EMPTY на nextToWrite): Writer ждёт; агрессивный timeout→tombstone
+        опционален (см. §10). Для homework достаточно чистого backpressure окна.
+  • Poison-pill / end signal
+      → после конца In Reader шлёт N poison-pill’ов или закрывает очередь;
+        workers завершаются; ReorderBuffer получает end; Writer drain’ит остаток
+        (DATA пишет, TOMBSTONE пропускает) до опустошения окна.
+
+7.4. Выходная папка Out/
+  • Out нет
+      → создать при старте (mkdirs); INFO в лог.
+  • Ошибка записи (диск, права, IOException)
+      → retry app.write.retry.count раз с задержкой app.write.retry.delay.ms;
+        если не помогло → ERROR + остановка Writer / всего пайплайна
+        (не терять порядок молча).
+  • Имена выходных файлов
+      → padded по seq, напр. 000001.json, 000002.json (фиксированная ширина),
+        чтобы порядок в проводнике совпадал с seq.
+  • Перезапись
+      → при повторном запуске: политика см. §7.5 (очистить Out или писать поверх).
+
+7.5. Жизненный цикл
+  • Graceful shutdown (Ctrl+C / shutdown hook)
+      → остановить Reader (не брать новые файлы);
+        дождаться drain ProcessingQueue;
+        дождаться workers;
+        дождаться, пока ReorderBuffer отдаст всё готовое Writer’у;
+        закрыть Writer; логировать итоги (прочитано / обработано / записано / skip).
+  • Restart / политика Out
+      → принято для homework: при старте очищать Out/ ИЛИ писать в чистый каталог;
+        не пытаться resume mid-seq. Документировать в README одной строкой.
+  • Некорректное прерывание mid-write
+      → частичный файл: при следующем старте Out очищается → ок для демо.
+
+7.6. Наблюдаемость (логи)
+  Обязательные события (уровень INFO/WARN/ERROR по смыслу):
+  • старт: t1, t2, N workers, queue capacity, пути In/Out;
+  • Reader: назначен seq=… для file=…;
+  • Worker: начало/конец обработки seq=… (опционально DEBUG);
+  • skip: битый JSON / исчезнувший файл / tombstone после fail worker;
+  • ReorderBuffer: ожидание seq=… (дыра), размер буфера;
+  • Writer: записан seq=… → Out/…..json;
+  • очередь: периодически или при backpressure — размер queue;
+  • shutdown: итоговые счётчики.
+
+
+8. Фазы реализации
+--------------------------------------------------------------------------------
+  1) Скелет Maven (Java 17) + application.properties + AppConfig (+ unit на валидацию).
+  2) Модель Message + JsonSupport (+ unit на parse/skip).
+  3) ReorderBuffer (ring) — TDD-first (§9.1): in-order, out-of-order, tombstone,
+     backpressure окна, duplicate seq, end/EOF. Затем ProcessingQueue + 1 worker + FileWriter.
+  4) Пул N workers + интеграция Reader→Workers→Reorder→Writer (маленький In→Out).
+  5) Краевые случаи §7: skip битого JSON, tombstone, backpressure, Out mkdirs.
+  6) Логи + graceful shutdown + краткий README (запуск, defaults, имена файлов).
+  7) Stress / load (§9.3) — отдельный профиль; после зелёного happy-path, не в фазе 1–3.
+
+
+9. Тестирование (Unit, Stress, TDD)
+--------------------------------------------------------------------------------
+Цель на собесе: показать, что критичные concurrency/order части покрыты тестами
+раньше «красивого» I/O, а тяжёлые проверки вынесены из быстрого suite.
+
+9.1. TDD-подход (практичный take-home, не догма)
+  • Не red-green-refactor на каждую строку. Test-first — для критичных компонентов
+    порядка и конкурентности (прежде всего ReorderBuffer), плюс валидация конфига
+    и правила чтения In/.
+  • Порядок «сначала тесты»:
+      1) ReorderBuffer (ring):
+         — in-order put → take;
+         — out-of-order complete, take строго по nextExpected;
+         — TOMBSTONE двигает курсор без записи;
+         — backpressure: окно полное → put блокируется / ждёт сдвига;
+         — duplicate seq (отклонить / идемпотентно — зафиксировать поведение);
+         — end/EOF: drain до пустого окна, Writer не висит.
+      2) AppConfig: defaults, fail на ≤0 / нечисловых, авто-workers.
+      3) FileReader: лексикографический порядок; skip без seq на битый JSON;
+         игнор не-*.json.
+      4) Интеграция: крошечный In→Out (t1/t2 = 1–3 ms), assert порядок Out
+         и наличие processedAt.
+  • Что НЕ TDD-ить первым: точные sleep-тайминги, полный stress/load —
+    после зелёного пути (§9.3).
+
+9.2. Unit-тесты (JUnit 5)
+  Production sleep’ы — из конфига; в тестах перекрывать properties / test-конфиг
+  (t1=0|1 ms, t2=1|3 ms), чтобы suite оставался быстрым. In/Out — через @TempDir.
+
+  AppConfig
+    • defaults, если файл отсутствует;
+    • FAIL при t1/t2/capacity/window ≤ 0 или нечисловых;
+    • app.workers < 0 → FAIL; =0 → ceil(t2/t1); >0 → как задано;
+    • t2 ≤ t1 → WARNING-путь, если логируемый/наблюдаемый в тесте.
+
+  ReorderBuffer
+    • кейсы из §9.1 п.1;
+    • concurrency: несколько потоков put + один take (CountDownLatch / Executor),
+      assert порядок выдачи и отсутствие зависания в разумном timeout теста.
+
+  FileReader / JsonSupport
+    • валидный объект → Message + seq;
+    • пустой / битый JSON / не-объект → skip, seq не назначен;
+    • не-*.json → игнор; сортировка имён лексикографическая (@TempDir).
+
+  ProcessingWorker
+    • после обработки в payload есть processedAt (presence или inject clock);
+    • sleep: mock / t2=0|1 ms в test-config — не ждать production 300 ms.
+
+  FileWriter
+    • имена Out padded по seq (000001.json …);
+    • retry при IO-сбое — если feasibly с temp dir / mock FS; иначе один happy-path
+      + документированный ручной/stress сценарий.
+
+9.3. Stress / load
+  • Не в default surefire: *StressTest / *IT или Maven-профиль `stress`
+    (failsafe), чтобы `mvn test` оставался быстрым.
+  • Сценарии:
+      — Много файлов (500–2000), t2>t1, N workers: |Out| == |валидных In|,
+        строгий порядок по seq/lex-именам Out, нет deadlock в timeout failsafe.
+      — Burst: малый queue.capacity → backpressure, пайплайн всё же завершается.
+      — Chaos: смесь валидных + битых JSON → skip в лог, Out только валидные,
+        порядок по seq валидных.
+      — Симуляция fail worker → TOMBSTONE, Writer не зависает на дыре.
+      — High contention: малое reorder.window vs много workers — корректность +
+        завершение, не «производительность любой ценой».
+  • Assertions: главное — correctness + no hang (failsafe timeout);
+    bound по duration — опционально.
+  • Запуск (предложение):
+      mvn test                 → unit + быстрые интеграционные
+      mvn -Pstress verify      → + stress/IT
+
+9.4. Раскладка в Maven
+  src/test/java/com/renaissance/pipeline/...
+  src/test/resources/application-test.properties
+      # пример: t1=1, t2=3, queue.capacity/window уменьшены под тесты
+
+
+10. Открытые / принятые допущения
+--------------------------------------------------------------------------------
+Принято:
+  • Эмуляция брокера = файлы; реального TIBCO/JMS нет.
+  • Batch one-shot: обработать снимок файлов In/ и завершиться (не daemon-watcher,
+    если не запрошено отдельно).
+  • processedAt — ISO-8601 или epoch millis (на выбор; зафиксировать в коде).
+  • JSON-библиотека: Jackson (предпочтительно) или Gson.
+  • Кодировка файлов: UTF-8.
+  • Имена In: ответственность демо-данных — zero-pad; код сортирует лексикографически.
+  • Тесты: JUnit 5; stress вне default suite (§9.3).
+
+Открыто / на усмотрение при реализации (не блокирует старт кода):
+  • Точная политика «In отсутствует»: FAIL vs create — рекомендация FAIL (§7.2).
+  • Точный таймаут «дыры» в reorder window vs чистый backpressure.
+  • Нужен ли WatchService на новые файлы в In/ (по умолчанию — нет, one-shot).
+  • Метрики в файл / Micrometer — не требуются; достаточно логов.
+  • Политика duplicate seq в ReorderBuffer (reject vs idempotent) — зафиксировать тестом.
+
+================================================================================
+Конец документа. Обновлять при новых решениях по открытым пунктам §10.
+================================================================================
