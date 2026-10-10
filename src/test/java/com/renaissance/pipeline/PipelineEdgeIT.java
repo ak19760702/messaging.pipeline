@@ -128,6 +128,31 @@ class PipelineEdgeIT {
         }
     }
 
+    /**
+     * Очередь на 1 слот, один воркер, t2=6 с: Reader не успевает положить poison-pill за свои 5 с.
+     * Раньше воркер навсегда оставался на queue.take() и awaitCompletion висел; теперь
+     * Pipeline дошлёт недостающий маркер и завершится сам.
+     */
+    @Test
+    @Timeout(value = 40, unit = TimeUnit.SECONDS)
+    void slowProcessingFullQueue_missingPoisonPillDeliveredByPipeline() throws Exception {
+        Path in = tempDir.resolve("In");
+        Path out = tempDir.resolve("Out");
+        Files.createDirectories(in);
+        Files.createDirectories(out);
+        write(in, "001.json", "{\"id\":1}");
+        write(in, "002.json", "{\"id\":2}");
+
+        AppConfig cfg = cfg(in, out, 1L, 6000L, 1, 1, 16);
+        Pipeline pipeline = Pipeline.startFull(cfg, in, out, new ReorderBuffer(cfg.reorderWindow()));
+        pipeline.awaitCompletion(30, TimeUnit.SECONDS);
+
+        assertEquals(0, pipeline.fileReader().getPoisonSentCount()); // Reader не успел сам
+        assertEquals(2, pipeline.fileReader().getAssignedCount());
+        assertEquals(2, pipeline.fileWriter().getWrittenCount());
+        assertEquals(2, listOutJson(out).size());
+    }
+
     @Test
     void outDirCreatedIfMissing() throws Exception {
         Path in = tempDir.resolve("In");

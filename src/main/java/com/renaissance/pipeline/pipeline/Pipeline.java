@@ -15,6 +15,7 @@ import com.renaissance.pipeline.writer.FileWriter;
 
 import java.nio.file.Path;
 import java.util.Objects;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -40,6 +41,7 @@ public final class Pipeline {
     private final int workerCount;
     private final PipelineMetrics metrics;    // null if metrics disabled
     private final MetricsSampler sampler;     // null if metrics disabled
+    private final BlockingQueue<Message> queue; // очередь Reader → Workers (для досылки poison-pill)
     private final AtomicBoolean stopRequested = new AtomicBoolean(false);
     private final AtomicBoolean completionStarted = new AtomicBoolean(false);
     private final CountDownLatch completionDone = new CountDownLatch(1);
@@ -54,7 +56,9 @@ public final class Pipeline {
             Thread writerThread,
             int workerCount,
             PipelineMetrics metrics,
-            MetricsSampler sampler) {
+            MetricsSampler sampler,
+            BlockingQueue<Message> queue) {
+        this.queue = queue;
         this.fileReader = fileReader;
         this.readerThread = readerThread;
         this.workerPool = workerPool;
@@ -149,7 +153,8 @@ public final class Pipeline {
         }
 
         Pipeline pipeline = new Pipeline(
-                reader, readerThread, pool, buffer, writer, writerThread, n, metrics, sampler);
+                reader, readerThread, pool, buffer, writer, writerThread, n, metrics, sampler,
+                queue.asBlockingQueue());
         self[0] = pipeline;
         if (writer != null) {
             writer.setOnFatal(() -> {
@@ -265,6 +270,8 @@ public final class Pipeline {
             }
         }
 
+        deliverMissingPoisonPills(deadlineNanos);
+
         workerPool.shutdown();
         remaining = deadlineNanos - System.nanoTime();
         boolean workersClean = remaining > 0
@@ -301,6 +308,30 @@ public final class Pipeline {
 
         if (!workersClean) {
             throw new InterruptedException("timeout waiting for workers");
+        }
+    }
+
+    /**
+     * Если Reader не успел положить все poison-pill (очередь была полна дольше 5 с),
+     * дослать недостающие: иначе воркер без маркера навсегда остаётся на queue.take().
+     * Не ждём, если пул уже остановлен (fatal) или buffer в abort, и не дольше общего deadline.
+     */
+    private void deliverMissingPoisonPills(long deadlineNanos) throws InterruptedException {
+        int missing = workerCount - fileReader.getPoisonSentCount();
+        if (missing <= 0) {
+            return;
+        }
+        SimpleLog.log("Pipeline: Reader delivered " + fileReader.getPoisonSentCount() + "/" + workerCount
+                + " poison-pill(s); delivering the remaining " + missing);
+        while (missing > 0 && !workerPool.isShutdown() && !buffer.isAborted()) {
+            long remaining = deadlineNanos - System.nanoTime();
+            if (remaining <= 0) {
+                return;
+            }
+            long waitNanos = Math.min(remaining, TimeUnit.MILLISECONDS.toNanos(200));
+            if (queue.offer(Message.poisonPill(), waitNanos, TimeUnit.NANOSECONDS)) {
+                missing--;
+            }
         }
     }
 
