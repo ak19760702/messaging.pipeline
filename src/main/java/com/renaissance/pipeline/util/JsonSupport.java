@@ -1,8 +1,12 @@
 package com.renaissance.pipeline.util;
 
+import com.fasterxml.jackson.core.JsonGenerator;
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.json.JsonMapper;
+import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.renaissance.pipeline.model.Message;
 
@@ -18,7 +22,21 @@ import java.util.Optional;
  */
 public final class JsonSupport {
 
-    private static final ObjectMapper MAPPER = new ObjectMapper();
+    /**
+     * Строгий разбор и запись без потери точности:
+     * <ul>
+     *   <li>{@code FAIL_ON_TRAILING_TOKENS} — после первого JSON-значения ничего лишнего
+     *       (иначе {@code {"id":1}{"id":2}} молча терял бы второй объект);</li>
+     *   <li>дроби читаются как {@code BigDecimal} и пишутся «как есть», без округления до double
+     *       и без {@code E}-нотации.</li>
+     * </ul>
+     */
+    private static final ObjectMapper MAPPER = JsonMapper.builder()
+            .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
+            .enable(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS)
+            .enable(JsonGenerator.Feature.WRITE_BIGDECIMAL_AS_PLAIN)
+            .nodeFactory(JsonNodeFactory.withExactBigDecimals(true))
+            .build();
 
     private JsonSupport() {
     }
