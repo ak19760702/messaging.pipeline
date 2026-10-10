@@ -73,6 +73,31 @@ class JsonSupportTest {
         assertEquals(42L, msg.seq());
     }
 
+    @Test
+    void secondRootValueAfterObjectIsSkip() {
+        assertTrue(JsonSupport.parseObject("{\"id\":1}{\"id\":2}").isEmpty());
+        assertTrue(JsonSupport.parseObject("{\"id\":1}\n{\"id\":2}").isEmpty());
+        assertTrue(JsonSupport.parseObject("{\"id\":1} true").isEmpty());
+    }
+
+    @Test
+    void trailingWhitespaceAfterObjectIsStillValid() {
+        assertTrue(JsonSupport.parseObject("{\"id\":1}\n").isPresent());
+        assertTrue(JsonSupport.parseObject("{\"id\":1}  \r\n").isPresent());
+    }
+
+    @Test
+    void longDecimalsSurviveRoundTripUnchanged() {
+        String in = "{\"a\":1.234567890123456789,\"b\":123456789.123456789123456789,"
+                + "\"c\":0.30000000000000000000001}";
+        ObjectNode node = JsonSupport.parseObject(in).orElseThrow();
+        String json = JsonSupport.toJson(JsonSupport.fromParsed(node, 0L));
+
+        assertTrue(json.contains("\"a\":1.234567890123456789"), json);
+        assertTrue(json.contains("\"b\":123456789.123456789123456789"), json);
+        assertTrue(json.contains("\"c\":0.30000000000000000000001"), json);
+    }
+
     private static JsonNode jsonSilent(String json) {
         try {
             return JsonSupport.mapper().readTree(json);
