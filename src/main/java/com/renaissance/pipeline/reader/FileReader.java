@@ -38,6 +38,8 @@ public final class FileReader implements Runnable {
     private long nextSeq;
     private long assignedCount;
     private long skippedCount;
+    /** Сколько poison-pill реально попало в очередь (может быть меньше {@code poisonPillCount}). */
+    private volatile int poisonSentCount;
 
     /** Reader с In/ из конфига и числом poison = эффективные workers. */
     public FileReader(AppConfig cfg, BlockingQueue<Message> queue) {
@@ -74,6 +76,14 @@ public final class FileReader implements Runnable {
     /** Число пропущенных файлов (битый JSON / недоступен). */
     public long getSkippedCount() {
         return skippedCount;
+    }
+
+    /**
+     * Сколько poison-pill Reader успел положить в очередь. Если меньше числа воркеров,
+     * недостающие должен дослать оркестратор ({@code Pipeline}), иначе воркеры зависнут на take().
+     */
+    public int getPoisonSentCount() {
+        return poisonSentCount;
     }
 
     /** Следующий seq к назначению (= число успешно назначенных). */
@@ -164,10 +174,11 @@ public final class FileReader implements Runnable {
             try {
                 if (!queue.offer(Message.poisonPill(), 5, TimeUnit.SECONDS)) {
                     SimpleLog.log("FileReader: timeout offering poison pill "
-                            + (i + 1) + "/" + poisonPillCount + "; workers may need shutdownNow");
+                            + (i + 1) + "/" + poisonPillCount + "; Pipeline will deliver the rest");
                     break;
                 }
                 sent++;
+                poisonSentCount = sent;
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 SimpleLog.log("FileReader: interrupted offering poison pills after sent=" + sent);
